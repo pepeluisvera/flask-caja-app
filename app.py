@@ -83,7 +83,6 @@ def index():
 def login():
     if admin_needs_password_setup():
         return redirect(url_for("setup_admin"))
-
     error = None
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
@@ -102,7 +101,6 @@ def setup_admin():
     admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
     if not admin or (admin.password_hash not in (None, "")):
         return redirect(url_for("index"))
-
     error = None
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
@@ -140,6 +138,98 @@ def resumen():
 def logout():
     logout_user()
     return redirect(url_for("login"))
+
+# ----------------------------------------------------------------------------
+# ABM Usuarios (RESTABLECIDO)
+# ----------------------------------------------------------------------------
+@app.route("/users")
+@login_required
+def users():
+    if not require_admin():
+        return redirect(url_for("menu"))
+    q = request.args.get("q", "").strip().lower()
+    users = User.query.order_by(User.id.asc()).all()
+    if q:
+        users = [u for u in users if q in (u.email or "").lower()]
+    return render_template_string(USERS_LIST_HTML, users=users, q=q, email=current_user.email)
+
+@app.route("/users/create", methods=["GET", "POST"])
+@login_required
+def users_create():
+    if not require_admin():
+        return redirect(url_for("menu"))
+    error = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        is_admin = request.form.get("is_admin") == "on"
+        if not email or not password:
+            error = "Email y contraseña son obligatorios."
+        elif User.query.filter_by(email=email).first():
+            error = "Ese email ya existe."
+        else:
+            u = User(email=email, is_admin=is_admin, is_active_flag=True)
+            u.set_password(password)
+            db.session.add(u)
+            db.session.commit()
+            flash("Usuario creado.", "ok")
+            return redirect(url_for("users"))
+    return render_template_string(USERS_CREATE_HTML, error=error)
+
+@app.route("/users/<int:user_id>/edit", methods=["GET", "POST"])
+@login_required
+def users_edit(user_id):
+    if not require_admin():
+        return redirect(url_for("menu"))
+    u = User.query.get_or_404(user_id)
+    error = None
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        is_admin = request.form.get("is_admin") == "on"
+        is_active = request.form.get("is_active") == "on"
+        if not email:
+            error = "Email es obligatorio."
+        else:
+            other = User.query.filter(User.email == email, User.id != u.id).first()
+            if other:
+                error = "Ese email ya está en uso por otro usuario."
+            else:
+                u.email = email
+                u.is_admin = is_admin
+                u.is_active_flag = is_active
+                db.session.commit()
+                flash("Usuario actualizado.", "ok")
+                return redirect(url_for("users"))
+    return render_template_string(USERS_EDIT_HTML, u=u, error=error)
+
+@app.route("/users/<int:user_id>/reset_password", methods=["POST"])
+@login_required
+def users_reset_password(user_id):
+    if not require_admin():
+        return redirect(url_for("menu"))
+    u = User.query.get_or_404(user_id)
+    new_pass = request.form.get("new_password", "")
+    if not new_pass:
+        flash("Nueva contraseña requerida.", "error")
+    else:
+        u.set_password(new_pass)
+        db.session.commit()
+        flash("Contraseña restablecida.", "ok")
+    return redirect(url_for("users_edit", user_id=user_id))
+
+@app.route("/users/<int:user_id>/delete", methods=["POST"])
+@login_required
+def users_delete(user_id):
+    if not require_admin():
+        return redirect(url_for("menu"))
+    u = User.query.get_or_404(user_id)
+    if u.id == current_user.id:
+        flash("No podés eliminarte a vos mismo.", "error")
+        return redirect(url_for("users"))
+    db.session.delete(u)
+    db.session.commit()
+    flash("Usuario eliminado.", "ok")
+    return redirect(url_for("users"))
 
 # ----------------------------------------------------------------------------
 # Templates
@@ -231,7 +321,107 @@ MENU_HTML = """<!doctype html>
     <ul>
       <li><a href="{{ url_for('movimientos') }}">Movimientos de Caja</a></li>
       <li><a href="{{ url_for('resumen') }}">Resumen de Caja</a></li>
+      {% if is_admin %}
+        <li><a href="{{ url_for('users') }}">Administración de usuarios</a></li>
+      {% endif %}
     </ul>
+  </div>
+</body></html>
+"""
+
+USERS_LIST_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Usuarios</title>""" + BASE_CSS + """</head>
+<body>
+  <header>
+    <h1>Administración de usuarios</h1>
+    <div>
+      <span>Admin: {{ email }}</span> | <a href="{{ url_for('logout') }}">Salir</a>
+    </div>
+  </header>
+  """ + FLASHES_HTML + """
+  <div class="card">
+    <form method="get">
+      <input type="search" name="q" placeholder="Buscar por email" value="{{ q }}">
+    </form>
+    <p>
+      <a class="primary" href="{{ url_for('users_create') }}">➕ Crear usuario</a> |
+      <a href="{{ url_for('menu') }}">Volver al menú</a>
+    </p>
+    <table>
+      <thead><tr><th>ID</th><th>Email</th><th>Admin</th><th>Activo</th><th class="right">Acciones</th></tr></thead>
+      <tbody>
+        {% for u in users %}
+        <tr>
+          <td>{{ u.id }}</td>
+          <td>{{ u.email }}</td>
+          <td>{{ "Sí" if u.is_admin else "No" }}</td>
+          <td>{{ "Sí" if u.is_active_flag else "No" }}</td>
+          <td class="right">
+            <a href="{{ url_for('users_edit', user_id=u.id) }}">Editar</a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</body></html>
+"""
+
+USERS_CREATE_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Crear usuario</title>""" + BASE_CSS + """</head>
+<body>
+  <header><h1>Crear usuario</h1></header>
+  """ + FLASHES_HTML + """
+  <div class="card">
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post">
+      <input type="email" name="email" placeholder="Email">
+      <div class="row">
+        <input type="password" name="password" placeholder="Contraseña">
+        <label style="display:flex;align-items:center;gap:8px;">
+          <input type="checkbox" name="is_admin"> Es administrador
+        </label>
+      </div>
+      <button type="submit" class="primary">Crear</button>
+      <a class="muted" href="{{ url_for('users') }}">Cancelar</a>
+    </form>
+  </div>
+</body></html>
+"""
+
+USERS_EDIT_HTML = """<!doctype html>
+<html><head><meta charset="utf-8"><title>Editar usuario</title>""" + BASE_CSS + """</head>
+<body>
+  <header><h1>Editar usuario</h1></header>
+  """ + FLASHES_HTML + """
+  <div class="card">
+    {% if error %}<p class="error">{{ error }}</p>{% endif %}
+    <form method="post">
+      <input type="email" name="email" placeholder="Email" value="{{ u.email }}">
+      <div class="row">
+        <label><input type="checkbox" name="is_admin" {% if u.is_admin %}checked{% endif %}> Es administrador</label>
+        <label><input type="checkbox" name="is_active" {% if u.is_active_flag %}checked{% endif %}> Activo</label>
+      </div>
+      <div class="row">
+        <button type="submit" class="primary">Guardar</button>
+        <a class="muted" href="{{ url_for('users') }}">Volver</a>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Restablecer contraseña</h3>
+    <form method="post" action="{{ url_for('users_reset_password', user_id=u.id) }}">
+      <input type="password" name="new_password" placeholder="Nueva contraseña">
+      <button type="submit">Restablecer</button>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Eliminar usuario</h3>
+    <form method="post" action="{{ url_for('users_delete', user_id=u.id) }}" onsubmit="return confirm('¿Seguro que quieres eliminar este usuario?');">
+      <button type="submit" class="danger">Eliminar</button>
+    </form>
   </div>
 </body></html>
 """
