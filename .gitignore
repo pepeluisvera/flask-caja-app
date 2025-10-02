@@ -1,0 +1,8 @@
+.env
+Tokens.txt
+venv/
+__pycache__/
+*.pyc
+*.sqlite3
+app.db
+.DS_Store
