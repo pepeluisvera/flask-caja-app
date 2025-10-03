@@ -2,6 +2,8 @@ from flask import Flask, render_template_string, request, redirect, url_for, fla
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 from datetime import datetime, date
 import os, re
 
@@ -23,6 +25,8 @@ SEED_CATEGORIES = [
     "Vaq. 2+",
     "Vaq. 3",
 ]
+
+DEFAULT_DAILY_GAIN = 0.6  # kg/día
 
 # -------------------------
 # Configuración de la app
@@ -67,8 +71,9 @@ def load_user(user_id):
 
 class Category(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(30), unique=True, nullable=False)  # máx 30, único
+    name = db.Column(db.String(30), unique=True, nullable=False)   # máx 30, único
     is_active = db.Column(db.Boolean, default=True, nullable=False)
+    daily_gain_kg = db.Column(db.Float, default=DEFAULT_DAILY_GAIN, nullable=False)  # kg/día
 
 class Animal(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -97,25 +102,37 @@ class Animal(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
-    def compute_estimated_weight(self, daily_gain_kg: float = 0.6) -> float | None:
+    def compute_estimated_weight(self, daily_gain_kg: float = DEFAULT_DAILY_GAIN) -> float | None:
         if not self.weight or not self.weigh_date:
             return None
         today = date.today()
         days = (today - self.weigh_date).days
         return round(self.weight + max(0, days) * daily_gain_kg, 1)
 
-# --- Bootstrap DB y seeds (sirve con gunicorn/render) ---
+# --- Bootstrap DB + seeds + “migración” ligera ---
 with app.app_context():
     db.create_all()
+
+    # MIGRACIÓN: agregar columna daily_gain_kg si falta (SQLite)
+    try:
+        db.session.execute(text("SELECT daily_gain_kg FROM category LIMIT 1"))
+    except OperationalError:
+        db.session.execute(text(
+            f"ALTER TABLE category ADD COLUMN daily_gain_kg FLOAT NOT NULL DEFAULT {DEFAULT_DAILY_GAIN}"
+        ))
+        db.session.commit()
+
+    # Seed admin si falta
     admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
     if not admin:
         admin = User(email="admin@local", is_admin=True, is_active_flag=True, password_hash=None)
         db.session.add(admin)
         db.session.commit()
-    # seed de categorías si la tabla está vacía
+
+    # Seed categorías si está vacío
     if Category.query.count() == 0:
         for n in SEED_CATEGORIES:
-            db.session.add(Category(name=n, is_active=True))
+            db.session.add(Category(name=n, is_active=True, daily_gain_kg=DEFAULT_DAILY_GAIN))
         db.session.commit()
 
 # -------------------------
@@ -174,21 +191,10 @@ BASE_CSS = """
 </style>
 """
 
-FLASHES_HTML = """
-{% with msgs = get_flashed_messages(with_categories=true) %}
-  {% if msgs %}
-    <div class="grid">
-      {% for cat, msg in msgs %}
-        <div class="flash {{ 'ok' if cat=='success' or cat=='ok' else 'error' if cat=='error' else '' }}">{{ msg }}</div>
-      {% endfor %}
-    </div>
-  {% endif %}
-{% endwith %}
-"""
-
+# IMPORTANTE: NO usar .format(...) aquí. Dejamos {{ title }} para Jinja.
 SHELL_HTML_HEAD = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>""" + BASE_CSS + """</head>
+<title>{{ title }}</title>""" + BASE_CSS + """</head>
 <body>
 <header class="appbar">
   <div class="container" style="display:flex; align-items:center; justify-content:space-between; gap:16px;">
@@ -211,6 +217,18 @@ SHELL_HTML_FOOT = """
   Hecho con Flask · {{ 'Admin' if current_user.is_authenticated and current_user.is_admin else 'Usuario' if current_user.is_authenticated else 'Invitado' }}
 </footer>
 </body></html>
+"""
+
+FLASHES_HTML = """
+{% with msgs = get_flashed_messages(with_categories=true) %}
+  {% if msgs %}
+    <div class="grid">
+      {% for cat, msg in msgs %}
+        <div class="flash {{ 'ok' if cat=='success' or cat=='ok' else 'error' if cat=='error' else '' }}">{{ msg }}</div>
+      {% endfor %}
+    </div>
+  {% endif %}
+{% endwith %}
 """
 
 # -------------------------
@@ -268,6 +286,12 @@ def active_category_names():
 def all_category_names():
     return [c.name for c in Category.query.order_by(Category.name.asc()).all()]
 
+def get_gain(cat_name: str | None) -> float:
+    if not cat_name:
+        return DEFAULT_DAILY_GAIN
+    c = Category.query.filter_by(name=cat_name).first()
+    return c.daily_gain_kg if c and c.daily_gain_kg is not None else DEFAULT_DAILY_GAIN
+
 # -------------------------
 # Autenticación y menú
 # -------------------------
@@ -301,25 +325,23 @@ def setup_admin():
             flash("Administrador configurado correctamente. Iniciá sesión.", "success")
             return redirect(url_for("login"))
 
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Configurar Administrador")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Primer uso</h1>
       <p class="lead">Definí el <strong>email</strong> y la <strong>contraseña</strong> del administrador.</p>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
         <input type="email" name="email" placeholder="Email admin" required>
         <div class="row"><input type="password" name="password" placeholder="Contraseña" required></div>
         <div class="row">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-ghost" href="{{{{ url_for('login') }}}}">Volver al login</a>
+          <a class="btn btn-ghost" href="{{ url_for('login') }}">Volver al login</a>
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, error=error)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, error=error, title="Configurar Administrador")
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -336,25 +358,23 @@ def login():
             return redirect(url_for("menu"))
         else:
             error = "Credenciales inválidas o usuario inactivo."
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Ingresar")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Ingresar</h1>
       <p class="lead">Accedé con tu email y contraseña.</p>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
         <input type="email" name="email" placeholder="Correo" autocomplete="username" required>
         <input type="password" name="password" placeholder="Contraseña" autocomplete="current-password" required>
         <div class="row">
           <button type="submit" class="btn btn-primary">Ingresar</button>
-          {{% if show_setup_link %}}<a class="btn btn-ghost" href="{{{{ url_for('setup_admin') }}}}">Configurar admin</a>{{% endif %}}
+          {% if show_setup_link %}<a class="btn btn-ghost" href="{{ url_for('setup_admin') }}">Configurar admin</a>{% endif %}
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, error=error, show_setup_link=admin_needs_password_setup())
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, error=error, show_setup_link=admin_needs_password_setup(), title="Ingresar")
 
 @app.route("/logout")
 @login_required
@@ -366,25 +386,23 @@ def logout():
 @app.route("/menu")
 @login_required
 def menu():
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Menú principal")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Menú principal</h1>
       <p class="lead">Elegí una opción para comenzar.</p>
       <div class="row" style="gap:10px;">
-        <a class="btn btn-primary" href="{{{{ url_for('movimientos') }}}}">Movimientos de Caja</a>
-        <a class="btn btn-muted" href="{{{{ url_for('resumen') }}}}">Resumen de Caja</a>
-        <a class="btn btn-ghost" href="{{{{ url_for('animals') }}}}">Animales</a>
-        {{% if current_user.is_admin %}}
-          <a class="btn btn-ghost" href="{{{{ url_for('categories') }}}}">Administrar categorías</a>
-          <a class="btn btn-ghost" href="{{{{ url_for('list_users') }}}}">Usuarios</a>
-        {{% endif %}}
+        <a class="btn btn-primary" href="{{ url_for('movimientos') }}">Movimientos de Caja</a>
+        <a class="btn btn-muted" href="{{ url_for('resumen') }}">Resumen de Caja</a>
+        <a class="btn btn-ghost" href="{{ url_for('animals') }}">Animales</a>
+        {% if current_user.is_admin %}
+          <a class="btn btn-ghost" href="{{ url_for('categories') }}">Administrar categorías</a>
+          <a class="btn btn-ghost" href="{{ url_for('list_users') }}">Usuarios</a>
+        {% endif %}
       </div>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, title="Menú principal")
 
 # -------------------------
 # Categorías (solo admin)
@@ -396,8 +414,8 @@ def categories():
 
     error = None
     if request.method == "POST":
-        # crear
         name = (request.form.get("name") or "").strip()
+        gain_raw = (request.form.get("daily_gain_kg") or str(DEFAULT_DAILY_GAIN)).strip().replace(",", ".")
         if not name:
             error = "El nombre es obligatorio."
         elif len(name) > 30:
@@ -405,45 +423,52 @@ def categories():
         elif Category.query.filter_by(name=name).first():
             error = "Ya existe una categoría con ese nombre."
         else:
-            db.session.add(Category(name=name, is_active=True))
+            try:
+                gain = float(gain_raw)
+                if gain < 0 or gain > 3:
+                    raise ValueError()
+            except ValueError:
+                error = "Ganancia diaria inválida (0.0 – 3.0)."
+        if not error:
+            db.session.add(Category(name=name, is_active=True, daily_gain_kg=gain))
             db.session.commit()
             flash("Categoría creada.", "success")
             return redirect(url_for("categories"))
 
     cats = Category.query.order_by(Category.is_active.desc(), Category.name.asc()).all()
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Categorías")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Categorías</h1>
-      <p class="lead">Activá/desactivá, creá nuevas o renombrá. Las inactivas no aparecerán en el combo, pero no rompen datos históricos.</p>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      <p class="lead">Activá/desactivá, creá nuevas o renombrá. Las inactivas no aparecen en combos, pero preservan datos históricos.</p>
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
 
       <form method="post" class="row" style="margin-bottom:12px;">
         <input type="text" name="name" placeholder="Nueva categoría (máx 30)" maxlength="30" required>
+        <input type="number" step="0.1" min="0" max="3" name="daily_gain_kg" placeholder="Ganancia kg/día" value="0.6" required>
         <button class="btn btn-primary" type="submit">Crear</button>
-        <a class="btn btn-ghost" href="{{{{ url_for('menu') }}}}">Volver</a>
+        <a class="btn btn-ghost" href="{{ url_for('menu') }}">Volver</a>
       </form>
 
       <table>
-        <thead><tr><th>Nombre</th><th>Estado</th><th class="nowrap">Acciones</th></tr></thead>
+        <thead><tr><th>Nombre</th><th>Estado</th><th>Ganancia (kg/d)</th><th class="nowrap">Acciones</th></tr></thead>
         <tbody>
-          {{% for c in cats %}}
+          {% for c in cats %}
           <tr>
-            <td>{{{{ c.name }}}}</td>
-            <td>{{{{ "Activa" if c.is_active else "Inactiva" }}}}</td>
+            <td>{{ c.name }}</td>
+            <td>{{ "Activa" if c.is_active else "Inactiva" }}</td>
+            <td>{{ "%.1f"|format(c.daily_gain_kg or 0.0) }}</td>
             <td class="nowrap">
-              <a href="{{{{ url_for('category_edit', cat_id=c.id) }}}}">Renombrar</a> ·
-              <a href="{{{{ url_for('category_toggle', cat_id=c.id) }}}}">{{{{ "Desactivar" if c.is_active else "Activar" }}}}</a>
+              <a href="{{ url_for('category_edit', cat_id=c.id) }}">Editar</a> ·
+              <a href="{{ url_for('category_toggle', cat_id=c.id) }}">{{ "Desactivar" if c.is_active else "Activar" }}</a>
             </td>
           </tr>
-          {{% endfor %}}
+          {% endfor %}
         </tbody>
       </table>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, error=error, cats=cats)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, error=error, cats=cats, title="Categorías")
 
 @app.route("/categories/<int:cat_id>/toggle")
 @login_required
@@ -463,6 +488,7 @@ def category_edit(cat_id):
     error = None
     if request.method == "POST":
         new_name = (request.form.get("name") or "").strip()
+        gain_raw = (request.form.get("daily_gain_kg") or "").strip().replace(",", ".")
         if not new_name:
             error = "El nombre es obligatorio."
         elif len(new_name) > 30:
@@ -470,31 +496,36 @@ def category_edit(cat_id):
         elif Category.query.filter(Category.name == new_name, Category.id != c.id).first():
             error = "Ya existe otra categoría con ese nombre."
         else:
-            # Renombrar NO cambia los animales existentes (guardan texto). Si querés “migrar” histórico,
-            # se podría agregar una acción opcional a futuro.
+            try:
+                gain = float(gain_raw)
+                if gain < 0 or gain > 3:
+                    raise ValueError()
+            except ValueError:
+                error = "Ganancia diaria inválida (0.0 – 3.0)."
+        if not error:
             c.name = new_name
+            c.daily_gain_kg = gain
             db.session.commit()
-            flash("Categoría renombrada.", "success")
+            flash("Categoría actualizada.", "success")
             return redirect(url_for("categories"))
 
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Renombrar categoría")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
-      <h1>Renombrar categoría</h1>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      <h1>Editar categoría</h1>
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="row">
-        <input type="text" name="name" value="{{{{ c.name }}}}" maxlength="30" required>
+        <input type="text" name="name" value="{{ c.name }}" maxlength="30" required>
+        <input type="number" step="0.1" min="0" max="3" name="daily_gain_kg" value="{{ '%.1f' % (c.daily_gain_kg or 0.0) }}" required>
         <button class="btn btn-primary" type="submit">Guardar</button>
-        <a class="btn btn-ghost" href="{{{{ url_for('categories') }}}}">Volver</a>
+        <a class="btn btn-ghost" href="{{ url_for('categories') }}">Volver</a>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, c=c, error=error)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, c=c, error=error, title="Editar categoría")
 
 # -------------------------
-# ANIMALES (ABM) – usa categorías activas
+# ANIMALES (ABM)
 # -------------------------
 def _validate_and_collect_animal_form(for_edit=False, current_category=None):
     tag_current = clean_tag(request.form.get("tag_current"))
@@ -522,15 +553,14 @@ def _validate_and_collect_animal_form(for_edit=False, current_category=None):
     sex = (request.form.get("sex") or "").strip().upper() or None
     sex = sex if sex in ("M", "H") else None
 
-    # Validación de categoría: debe estar en activas. Si estás editando y el animal tiene una inactiva,
-    # permitimos mantener ese valor (no seleccionable para nuevos).
+    # Validación de categoría (activa). En edición, permitir mantener una inactiva existente.
     cat = (request.form.get("category") or "").strip()
     actives = set(active_category_names())
     allcats = set(all_category_names())
     if cat:
         if cat not in actives:
             if for_edit and current_category and cat == current_category and cat in allcats:
-                pass  # permitir mantener inactiva existente
+                pass
             else:
                 return None, "Categoría inválida."
     else:
@@ -588,23 +618,22 @@ def animals():
 
     animals = query.order_by(Animal.id.desc()).all()
 
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Animales")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <div class="row" style="justify-content:space-between; align-items:center;">
         <div><h1>Animales</h1><p class="lead">Base de datos de bovinos.</p></div>
-        <a class="btn btn-primary" href="{{{{ url_for('animals_new') }}}}">➕ Nuevo animal</a>
+        <a class="btn btn-primary" href="{{ url_for('animals_new') }}">➕ Nuevo animal</a>
       </div>
 
       <form method="get" class="row" style="margin-top:8px;">
-        <input type="search" name="q" placeholder="Buscar por caravana / comentario / diagnóstico" value="{{{{ request.args.get('q','') }}}}">
-        <input type="text" name="lot" placeholder="Lote" value="{{{{ request.args.get('lot','') }}}}">
-        <input type="text" name="breed" placeholder="Raza" value="{{{{ request.args.get('breed','') }}}}">
-        <input type="text" name="origin" placeholder="Origen" value="{{{{ request.args.get('origin','') }}}}">
-        <input type="text" name="category" placeholder="Categoría" value="{{{{ request.args.get('category','') }}}}">
+        <input type="search" name="q" placeholder="Buscar por caravana / comentario / diagnóstico" value="{{ request.args.get('q','') }}">
+        <input type="text" name="lot" placeholder="Lote" value="{{ request.args.get('lot','') }}">
+        <input type="text" name="breed" placeholder="Raza" value="{{ request.args.get('breed','') }}">
+        <input type="text" name="origin" placeholder="Origen" value="{{ request.args.get('origin','') }}">
+        <input type="text" name="category" placeholder="Categoría" value="{{ request.args.get('category','') }}">
         <button class="btn btn-muted" type="submit">Filtrar</button>
-        <a class="btn btn-ghost" href="{{{{ url_for('animals') }}}}">Limpiar</a>
+        <a class="btn btn-ghost" href="{{ url_for('animals') }}">Limpiar</a>
       </form>
 
       <div class="grid" style="overflow:auto;">
@@ -618,39 +647,38 @@ def animals():
             </tr>
           </thead>
           <tbody>
-            {{% for a in animals %}}
+            {% for a in animals %}
             <tr>
-              <td>{{{{ a.id }}}}</td>
+              <td>{{ a.id }}</td>
               <td>
-                <div><strong>{{{{ a.tag_current }}}}</strong></div>
-                {{% if a.tag_previous %}}<div class="muted">Ant.: {{{{ a.tag_previous }}}}</div>{{% endif %}}
+                <div><strong>{{ a.tag_current }}</strong></div>
+                {% if a.tag_previous %}<div class="muted">Ant.: {{ a.tag_previous }}</div>{% endif %}
               </td>
-              <td>{{{{ a.weight if a.weight is not none else '' }}}}</td>
-              <td>{{{{ fmt_date(a.weigh_date) }}}}</td>
-              <td>{{{{ a.est_weight_today if a.est_weight_today is not none else (a.compute_estimated_weight() or '') }}}}</td>
-              <td>{{{{ 'M' if a.sex=='M' else 'H' if a.sex=='H' else '' }}}}</td>
-              <td>{{{{ a.breed or '' }}}}</td>
-              <td>{{{{ a.lot or '' }}}}</td>
-              <td>{{{{ a.origin or '' }}}}</td>
-              <td>{{{{ a.category or '' }}}}</td>
-              <td>{{{{ fmt_date(a.last_seen) }}}}</td>
-              <td>{{{{ fmt_date(a.read_date) }}}}</td>
-              <td>{{{{ a.diagnosis or '' }}}}</td>
-              <td>{{{{ a.comment or '' }}}}</td>
+              <td>{{ a.weight if a.weight is not none else '' }}</td>
+              <td>{{ fmt_date(a.weigh_date) }}</td>
+              <td>{{ a.est_weight_today if a.est_weight_today is not none else (a.compute_estimated_weight(get_gain(a.category)) or '') }}</td>
+              <td>{{ 'M' if a.sex=='M' else 'H' if a.sex=='H' else '' }}</td>
+              <td>{{ a.breed or '' }}</td>
+              <td>{{ a.lot or '' }}</td>
+              <td>{{ a.origin or '' }}</td>
+              <td>{{ a.category or '' }}</td>
+              <td>{{ fmt_date(a.last_seen) }}</td>
+              <td>{{ fmt_date(a.read_date) }}</td>
+              <td>{{ a.diagnosis or '' }}</td>
+              <td>{{ a.comment or '' }}</td>
               <td class="nowrap">
-                <a href="{{{{ url_for('animals_edit', animal_id=a.id) }}}}">Editar</a>
-                {{% if current_user.is_admin %}}· <a href="{{{{ url_for('animals_delete', animal_id=a.id) }}}}" onclick="return confirm('¿Eliminar animal?');" class="danger">Eliminar</a>{{% endif %}}
+                <a href="{{ url_for('animals_edit', animal_id=a.id) }}">Editar</a>
+                {% if current_user.is_admin %}· <a href="{{ url_for('animals_delete', animal_id=a.id) }}" onclick="return confirm('¿Eliminar animal?');" class="danger">Eliminar</a>{% endif %}
               </td>
             </tr>
-            {{% endfor %}}
+            {% endfor %}
           </tbody>
         </table>
-        <div class="links"><a href="{{{{ url_for('menu') }}}}">Volver al menú</a></div>
+        <div class="links"><a href="{{ url_for('menu') }}">Volver al menú</a></div>
       </div>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, animals=animals, fmt_date=fmt_date)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, animals=animals, fmt_date=fmt_date, get_gain=get_gain, title="Animales")
 
 @app.route("/animals/new", methods=["GET", "POST"])
 @login_required
@@ -663,7 +691,7 @@ def animals_new():
         if not error:
             a = Animal(**data)
             if a.est_weight_today is None:
-                calc = a.compute_estimated_weight()
+                calc = a.compute_estimated_weight(get_gain(a.category))
                 if calc is not None:
                     a.est_weight_today = calc
             db.session.add(a)
@@ -683,12 +711,11 @@ def animals_new():
             ops.append(f'<option value="{n}">{n}</option>')
         return "".join(ops)
 
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Nuevo animal")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Nuevo animal</h1>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
         <div class="row">
           <input type="text" name="tag_current" placeholder="Caravana (actual) — solo dígitos y espacios" required>
@@ -708,7 +735,7 @@ def animals_new():
             <option value="H">Hembra (H)</option>
           </select>
           <select name="breed">
-            {breed_options()}
+            """ + breed_options() + """
           </select>
           <input type="text" name="lot" placeholder="Lote (máx 20)" maxlength="20">
         </div>
@@ -716,7 +743,7 @@ def animals_new():
         <div class="row">
           <input type="text" name="origin" placeholder="Origen (máx 30)" maxlength="30">
           <select name="category">
-            {category_options()}
+            """ + category_options() + """
           </select>
         </div>
 
@@ -731,13 +758,12 @@ def animals_new():
 
         <div class="row">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-ghost" href="{{{{ url_for('animals') }}}}">Cancelar</a>
+          <a class="btn btn-ghost" href="{{ url_for('animals') }}">Cancelar</a>
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, error=error)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, error=error, title="Nuevo animal")
 
 @app.route("/animals/<int:animal_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -755,7 +781,7 @@ def animals_edit(animal_id):
             for k, v in data.items():
                 setattr(a, k, v)
             if a.est_weight_today is None:
-                calc = a.compute_estimated_weight()
+                calc = a.compute_estimated_weight(get_gain(a.category))
                 a.est_weight_today = calc if calc is not None else a.est_weight_today
             db.session.commit()
             flash("Animal actualizado.", "success")
@@ -764,7 +790,6 @@ def animals_edit(animal_id):
     def category_options_with_current(current):
         ops = ['<option value="">(sin seleccionar)</option>']
         actives = active_category_names()
-        # incluir la actual (aunque esté inactiva) para no perderla
         showed_current = False
         for n in actives:
             sel = ' selected' if (current or '') == n else ''
@@ -781,61 +806,59 @@ def animals_edit(animal_id):
             ops.append(f'<option value="{n}"{sel}>{n}</option>')
         return "".join(ops)
 
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Editar animal")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Editar animal</h1>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
         <div class="row">
-          <input type="text" name="tag_current" placeholder="Caravana (actual)" value="{{{{ a.tag_current }}}}" required>
-          <input type="text" name="tag_previous" placeholder="Caravana anterior" value="{{{{ a.tag_previous or '' }}}}">
+          <input type="text" name="tag_current" placeholder="Caravana (actual)" value="{{ a.tag_current }}" required>
+          <input type="text" name="tag_previous" placeholder="Caravana anterior" value="{{ a.tag_previous or '' }}">
         </div>
 
         <div class="row">
-          <input type="text" name="weight" placeholder="Peso (kg)" value="{{{{ a.weight if a.weight is not None else '' }}}}" maxlength="6">
-          <input type="text" name="weigh_date" placeholder="Fecha de pesaje (DD/MM/AA)" value="{{{{ fmt_date(a.weigh_date) }}}}" maxlength="8">
-          <input type="text" name="est_weight_today" placeholder="Peso estimado hoy (kg)" value="{{{{ a.est_weight_today if a.est_weight_today is not None else (a.compute_estimated_weight() or '') }}}}" maxlength="6">
+          <input type="text" name="weight" placeholder="Peso (kg)" value="{{ a.weight if a.weight is not None else '' }}" maxlength="6">
+          <input type="text" name="weigh_date" placeholder="Fecha de pesaje (DD/MM/AA)" value="{{ fmt_date(a.weigh_date) }}" maxlength="8">
+          <input type="text" name="est_weight_today" placeholder="Peso estimado hoy (kg)" value="{{ a.est_weight_today if a.est_weight_today is not None else (a.compute_estimated_weight(get_gain(a.category)) or '') }}" maxlength="6">
         </div>
 
         <div class="row">
           <select name="sex">
             <option value="">Sexo</option>
-            <option value="M" {{% if a.sex=='M' %}}selected{{% endif %}}>Macho (M)</option>
-            <option value="H" {{% if a.sex=='H' %}}selected{{% endif %}}>Hembra (H)</option>
+            <option value="M" {% if a.sex=='M' %}selected{% endif %}>Macho (M)</option>
+            <option value="H" {% if a.sex=='H' %}selected{% endif %}>Hembra (H)</option>
           </select>
           <select name="breed">
-            {breed_options_with_current("{{ a.breed or '' }}")}
+            """ + breed_options_with_current("{{ a.breed or '' }}") + """
           </select>
-          <input type="text" name="lot" placeholder="Lote" value="{{{{ a.lot or '' }}}}" maxlength="20">
+          <input type="text" name="lot" placeholder="Lote" value="{{ a.lot or '' }}" maxlength="20">
         </div>
 
         <div class="row">
-          <input type="text" name="origin" placeholder="Origen" value="{{{{ a.origin or '' }}}}" maxlength="30">
+          <input type="text" name="origin" placeholder="Origen" value="{{ a.origin or '' }}" maxlength="30">
           <select name="category">
-            {category_options_with_current("{{ a.category or '' }}")}
+            """ + category_options_with_current("{{ a.category or '' }}") + """
           </select>
         </div>
 
         <div class="row">
-          <input type="text" name="read_date" placeholder="Fecha de lectura (DD/MM/AA)" value="{{{{ fmt_date(a.read_date) }}}}" maxlength="8">
-          <input type="text" name="last_seen" placeholder="Última vez (DD/MM/AA)" value="{{{{ fmt_date(a.last_seen) }}}}" maxlength="8">
-          <input type="text" name="birth_date" placeholder="Fecha de nacimiento (DD/MM/AA)" value="{{{{ fmt_date(a.birth_date) }}}}" maxlength="8">
+          <input type="text" name="read_date" placeholder="Fecha de lectura (DD/MM/AA)" value="{{ fmt_date(a.read_date) }}" maxlength="8">
+          <input type="text" name="last_seen" placeholder="Última vez (DD/MM/AA)" value="{{ fmt_date(a.last_seen) }}" maxlength="8">
+          <input type="text" name="birth_date" placeholder="Fecha de nacimiento (DD/MM/AA)" value="{{ fmt_date(a.birth_date) }}" maxlength="8">
         </div>
 
-        <input type="text" name="diagnosis" placeholder="Diagnóstico (máx 10)" value="{{{{ a.diagnosis or '' }}}}" maxlength="10">
-        <input type="text" name="comment" placeholder="Comentario (máx 30)" value="{{{{ a.comment or '' }}}}" maxlength="30">
+        <input type="text" name="diagnosis" placeholder="Diagnóstico (máx 10)" value="{{ a.diagnosis or '' }}" maxlength="10">
+        <input type="text" name="comment" placeholder="Comentario (máx 30)" value="{{ a.comment or '' }}" maxlength="30">
 
         <div class="row">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-ghost" href="{{{{ url_for('animals') }}}}">Volver</a>
+          <a class="btn btn-ghost" href="{{ url_for('animals') }}">Volver</a>
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, a=a, error=error, fmt_date=fmt_date)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, a=a, error=error, fmt_date=fmt_date, get_gain=get_gain, title="Editar animal")
 
 @app.route("/animals/<int:animal_id>/delete")
 @login_required
@@ -849,35 +872,33 @@ def animals_delete(animal_id):
     return redirect(url_for("animals"))
 
 # -------------------------
-# Usuarios (atajos mínimos)
+# Usuarios (solo admin)
 # -------------------------
 @app.route("/users")
 @login_required
 def list_users():
     if not require_admin(): return redirect(url_for("menu"))
     users = User.query.order_by(User.id.asc()).all()
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Usuarios")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Usuarios</h1>
-      <p><a class="btn btn-primary" href="{{{{ url_for('new_user') }}}}">➕ Crear usuario</a> · <a class="btn btn-ghost" href="{{{{ url_for('menu') }}}}">Volver</a></p>
+      <p><a class="btn btn-primary" href="{{ url_for('new_user') }}">➕ Crear usuario</a> · <a class="btn btn-ghost" href="{{ url_for('menu') }}">Volver</a></p>
       <table>
         <thead><tr><th>ID</th><th>Email</th><th>Admin</th><th>Activo</th><th>Acciones</th></tr></thead>
         <tbody>
-          {{% for u in users %}}
+          {% for u in users %}
           <tr>
-            <td>{{{{ u.id }}}}</td><td>{{{{ u.email }}}}</td>
-            <td>{{{{ "Sí" if u.is_admin else "No" }}}}</td><td>{{{{ "Sí" if u.is_active_flag else "No" }}}}</td>
-            <td><a href="{{{{ url_for('edit_user', user_id=u.id) }}}}">Editar</a></td>
+            <td>{{ u.id }}</td><td>{{ u.email }}</td>
+            <td>{{ "Sí" if u.is_admin else "No" }}</td><td>{{ "Sí" if u.is_active_flag else "No" }}</td>
+            <td><a href="{{ url_for('edit_user', user_id=u.id) }}">Editar</a></td>
           </tr>
-          {{% endfor %}}
+          {% endfor %}
         </tbody>
       </table>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, users=users)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, users=users, title="Usuarios")
 
 @app.route("/users/new", methods=["GET", "POST"])
 @login_required
@@ -898,12 +919,11 @@ def new_user():
             db.session.add(u); db.session.commit()
             flash("Usuario creado.", "success")
             return redirect(url_for("list_users"))
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Nuevo usuario")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Nuevo usuario</h1>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
         <input type="email" name="email" placeholder="Email" required>
         <div class="row">
@@ -912,13 +932,12 @@ def new_user():
         </div>
         <div class="row">
           <button class="btn btn-primary" type="submit">Crear</button>
-          <a class="btn btn-ghost" href="{{{{ url_for('list_users') }}}}">Volver</a>
+          <a class="btn btn-ghost" href="{{ url_for('list_users') }}">Volver</a>
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, error=error)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, error=error, title="Nuevo usuario")
 
 @app.route("/users/<int:user_id>/edit", methods=["GET", "POST"])
 @login_required
@@ -943,28 +962,26 @@ def edit_user(user_id):
             db.session.commit()
             flash("Usuario actualizado.", "success")
             return redirect(url_for("list_users"))
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Editar usuario")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Editar usuario</h1>
-      {{% if error %}}<div class="flash error">{{{{ error }}}}</div>{{% endif %}}
+      {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
-        <input type="email" name="email" placeholder="Email" value="{{{{ u.email }}}}">
+        <input type="email" name="email" placeholder="Email" value="{{ u.email }}">
         <div class="row">
-          <label><input type="checkbox" name="is_admin" {{% if u.is_admin %}}checked{{% endif %}}> Es administrador</label>
-          <label><input type="checkbox" name="is_active" {{% if u.is_active_flag %}}checked{{% endif %}}> Activo</label>
+          <label><input type="checkbox" name="is_admin" {% if u.is_admin %}checked{% endif %}> Es administrador</label>
+          <label><input type="checkbox" name="is_active" {% if u.is_active_flag %}checked{% endif %}> Activo</label>
         </div>
         <input type="password" name="password" placeholder="Nueva contraseña (opcional)">
         <div class="row">
           <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-ghost" href="{{{{ url_for('list_users') }}}}">Volver</a>
+          <a class="btn btn-ghost" href="{{ url_for('list_users') }}">Volver</a>
         </div>
       </form>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content, u=u, error=error)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, u=u, error=error, title="Editar usuario")
 
 # -------------------------
 # Caja (placeholders)
@@ -972,32 +989,28 @@ def edit_user(user_id):
 @app.route("/movimientos")
 @login_required
 def movimientos():
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Movimientos de Caja")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Movimientos de Caja</h1>
       <p class="lead">Aquí irá el módulo de movimientos.</p>
-      <a class="btn btn-ghost" href="{{{{ url_for('menu') }}}}">Volver al menú</a>
+      <a class="btn btn-ghost" href="{{ url_for('menu') }}">Volver al menú</a>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, title="Movimientos de Caja")
 
 @app.route("/resumen")
 @login_required
 def resumen():
-    content = f"""
-    {SHELL_HTML_HEAD.format(title="Resumen de Caja")}
-    {FLASHES_HTML}
+    content = SHELL_HTML_HEAD + """
+    """ + FLASHES_HTML + """
     <div class="grid"><div class="card">
       <h1>Resumen de Caja</h1>
       <p class="lead">Aquí irá el módulo de resumen.</p>
-      <a class="btn btn-ghost" href="{{{{ url_for('menu') }}}}">Volver al menú</a>
+      <a class="btn btn-ghost" href="{{ url_for('menu') }}">Volver al menú</a>
     </div></div>
-    {SHELL_HTML_FOOT}
-    """
-    return render_template_string(content)
+    """ + SHELL_HTML_FOOT
+    return render_template_string(content, title="Resumen de Caja")
 
 # -------------------------
 # Main (solo local)
