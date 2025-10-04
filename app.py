@@ -305,10 +305,10 @@ def index():
 
 @app.route("/setup_admin", methods=["GET", "POST"])
 def setup_admin():
-    # Admin "placeholder" creado al iniciar la app (posible email admin@local y password None)
+    # Buscar el admin "placeholder" (o el primero que haya)
     admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
 
-    # Si ya hay un admin con contraseña configurada, no permitir reconfigurar
+    # Si ya existe un admin con password, no permitir reconfigurar
     if admin and admin.password_hash:
         return redirect(url_for("login"))
 
@@ -321,36 +321,45 @@ def setup_admin():
         if not email or not password:
             error = "Email y contraseña son obligatorios."
         else:
-            # ¿Existe otro usuario con ese email?
             existing = User.query.filter_by(email=email).first()
 
             if admin is None:
-                # No había admin aún: dos casos
+                # No hay admin aún
                 if existing:
                     # Promover usuario existente a admin
                     existing.is_admin = True
                     if not existing.password_hash:
                         existing.set_password(password)
-                    db.session.commit()
-                    flash("Administrador configurado usando un usuario existente.", "success")
-                    return redirect(url_for("login"))
+                    try:
+                        db.session.commit()
+                        flash("Administrador configurado usando un usuario existente.", "success")
+                        return redirect(url_for("login"))
+                    except Exception as e:
+                        db.session.rollback()
+                        error = "No se pudo promover el usuario existente. " + str(e)
                 else:
-                    # Crear admin desde cero
+                    # Crear admin nuevo
                     new_admin = User(email=email, is_admin=True, is_active_flag=True)
                     new_admin.set_password(password)
-                    db.session.add(new_admin)
-                    db.session.commit()
-                    flash("Administrador creado correctamente.", "success")
-                    return redirect(url_for("login"))
+                    try:
+                        db.session.add(new_admin)
+                        db.session.commit()
+                        flash("Administrador creado correctamente.", "success")
+                        return redirect(url_for("login"))
+                    except Exception as e:
+                        db.session.rollback()
+                        if "UNIQUE constraint failed: user.email" in str(e):
+                            error = "Ese email ya está registrado."
+                        else:
+                            error = "No se pudo crear el administrador. " + str(e)
             else:
-                # Hay un admin placeholder (probablemente admin@local, sin password)
+                # Hay un admin placeholder (sin password) → reusarlo
                 if existing and existing.id != admin.id:
-                    # El email ya pertenece a otro usuario: promoverlo a admin y eliminar el placeholder
+                    # El email pertenece a otro usuario → promoverlo y borrar placeholder
                     existing.is_admin = True
                     if not existing.password_hash:
                         existing.set_password(password)
                     try:
-                        # Si el placeholder está "vacío" (sin password), lo eliminamos para no duplicar
                         if not admin.password_hash:
                             db.session.delete(admin)
                         db.session.commit()
@@ -360,33 +369,17 @@ def setup_admin():
                         db.session.rollback()
                         error = "No se pudo promover el usuario existente. " + str(e)
                 else:
-                    # Email libre o es el mismo registro → configurar el placeholder
-                    existing = User.query.filter(User.email == email, User.id != admin.id).first()
-if existing:
-    # Ese email ya está en otro usuario → promoverlo
-    existing.is_admin = True
-    if not existing.password_hash:
-        existing.set_password(password)
-    # eliminar el admin placeholder si no tiene password aún
-    if not admin.password_hash:
-        db.session.delete(admin)
-    db.session.commit()
-    flash("Administrador configurado promoviendo usuario existente.", "success")
-    return redirect(url_for("login"))
-else:
-    # Email libre → reusar admin placeholder
-    admin.email = email
-    admin.set_password(password)
-    db.session.commit()
-    flash("Administrador configurado correctamente.", "success")
-    return redirect(url_for("login"))
-                        flash("Administrador configurado. Iniciá sesión.", "success")
+                    # Email libre o es el mismo registro del placeholder
+                    try:
+                        admin.email = email
+                        admin.set_password(password)
+                        db.session.commit()
+                        flash("Administrador configurado correctamente.", "success")
                         return redirect(url_for("login"))
                     except Exception as e:
                         db.session.rollback()
-                        # Si fue por UNIQUE, avisar de forma amable
                         if "UNIQUE constraint failed: user.email" in str(e):
-                            error = "Ese email ya está registrado. Usá otro o dejá ese usuario como admin desde aquí."
+                            error = "Ese email ya está registrado."
                         else:
                             error = "No se pudo guardar el administrador. " + str(e)
 
@@ -397,11 +390,11 @@ else:
       <p class="lead">Definí el <strong>email</strong> y la <strong>contraseña</strong> del administrador.</p>
       {% if error %}<div class="flash error">{{ error }}</div>{% endif %}
       <form method="post" class="grid">
-        <input type="email" name="email" placeholder="Email admin" required>
-        <div class="row"><input type="password" name="password" placeholder="Contraseña" required></div>
+        <input type="email" name="email" placeholder="Email admin" autocomplete="username" required>
+        <input type="password" name="password" placeholder="Contraseña" autocomplete="new-password" required>
         <div class="row">
-          <button class="btn btn-primary" type="submit">Guardar</button>
-          <a class="btn btn-ghost" href="{{ url_for('login') }}">Volver al login</a>
+          <button type="submit" class="btn btn-primary">Guardar</button>
+          <a class="btn btn-ghost" href="{{ url_for('login') }}">Ir a Login</a>
         </div>
       </form>
     </div></div>
