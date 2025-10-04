@@ -303,7 +303,7 @@ def index():
         return redirect(url_for("menu"))
     return redirect(url_for("login"))
 
-@@app.route("/setup_admin", methods=["GET", "POST"])
+@app.route("/setup_admin", methods=["GET", "POST"])
 def setup_admin():
     # Admin "placeholder" creado al iniciar la app (posible email admin@local y password None)
     admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
@@ -361,10 +361,25 @@ def setup_admin():
                         error = "No se pudo promover el usuario existente. " + str(e)
                 else:
                     # Email libre o es el mismo registro → configurar el placeholder
-                    try:
-                        admin.email = email
-                        admin.set_password(password)
-                        db.session.commit()
+                    existing = User.query.filter(User.email == email, User.id != admin.id).first()
+if existing:
+    # Ese email ya está en otro usuario → promoverlo
+    existing.is_admin = True
+    if not existing.password_hash:
+        existing.set_password(password)
+    # eliminar el admin placeholder si no tiene password aún
+    if not admin.password_hash:
+        db.session.delete(admin)
+    db.session.commit()
+    flash("Administrador configurado promoviendo usuario existente.", "success")
+    return redirect(url_for("login"))
+else:
+    # Email libre → reusar admin placeholder
+    admin.email = email
+    admin.set_password(password)
+    db.session.commit()
+    flash("Administrador configurado correctamente.", "success")
+    return redirect(url_for("login"))
                         flash("Administrador configurado. Iniciá sesión.", "success")
                         return redirect(url_for("login"))
                     except Exception as e:
