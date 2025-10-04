@@ -875,7 +875,7 @@ def animals_edit(animal_id):
         </div>
 
         <div class="row">
-          <input type="text" name="weight" placeholder="Peso (kg)" value="{{ a.weight if a.weight is not None else '' }}" maxlength="6">
+          <input type="text" name="weight" placeholder="Peso (kg)" value="{{ a.weight if a.weight is not none else '' }}" maxlength="6">
           <input type="text" name="weigh_date" placeholder="Fecha de pesaje (DD/MM/AA)" value="{{ fmt_date(a.weigh_date) }}" maxlength="8">
           <input type="text" name="est_weight_today" placeholder="Peso estimado hoy (kg)" value="{{ a.est_weight_today if a.est_weight_today is not None else (a.compute_estimated_weight(get_gain(a.category)) or '') }}" maxlength="6">
         </div>
