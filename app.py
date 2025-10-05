@@ -277,9 +277,12 @@ def require_admin():
     return True
 
 def admin_needs_password_setup():
-    admin = User.query.filter_by(is_admin=True).order_by(User.id.asc()).first()
-    return (admin is None) or (not admin.password_hash)
-
+    """Devuelve True solo si NO existe ningún admin con contraseña configurada."""
+    configured = User.query.filter(
+        User.is_admin == True,
+        User.password_hash.isnot(None)
+    ).first()
+    return configured is None
 def active_category_names():
     return [c.name for c in Category.query.filter_by(is_active=True).order_by(Category.name.asc()).all()]
 
